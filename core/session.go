@@ -17,16 +17,18 @@ import (
 type Session struct {
 	sync.Mutex
 
-	Version      string
-	Log          *Logger
-	Options      *Options
-	Config       *Config
-	Signatures   []Signature
-	Repositories chan int64
-	Gists        chan string
-	Context      context.Context
-	Clients      []*GitHubClientWrapper
-	CsvWriter    *csv.Writer
+	Version          string
+	Log              *Logger
+	Options          *Options
+	Config           *Config
+	Signatures       []Signature
+	Repositories     chan GitResource
+	Gists            chan string
+	Comments         chan string
+	Context          context.Context
+	Clients          chan *GitHubClientWrapper
+	ExhaustedClients chan *GitHubClientWrapper
+	CsvWriter        *csv.Writer
 }
 
 var (
@@ -56,46 +58,67 @@ func (s *Session) InitSignatures() {
 }
 
 func (s *Session) InitGitHubClients() {
-	for _, token := range s.Config.GitHubAccessTokens {
-		ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
-		tc := oauth2.NewClient(s.Context, ts)
+	if len(*s.Options.Local) <= 0 {
+		chanSize := *s.Options.Threads * (len(s.Config.GitHubAccessTokens) + 1)
+		s.Clients = make(chan *GitHubClientWrapper, chanSize)
+		s.ExhaustedClients = make(chan *GitHubClientWrapper, chanSize)
+		for _, token := range s.Config.GitHubAccessTokens {
+			ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+			tc := oauth2.NewClient(s.Context, ts)
 
-		client := github.NewClient(tc)
+			client := github.NewClient(tc)
+			client.UserAgent = fmt.Sprintf("%s v%s", Name, Version)
+			_, _, err := client.Users.Get(s.Context, "")
 
-		client.UserAgent = fmt.Sprintf("%s v%s", Name, Version)
-		_, _, err := client.Users.Get(s.Context, "")
+			if err != nil {
+				if _, ok := err.(*github.ErrorResponse); ok {
+					s.Log.Warn("Failed to validate token %s[..]: %s", token[:10], err)
+					continue
+				}
+			}
 
-		if err != nil {
-			if _, ok := err.(*github.ErrorResponse); ok {
-				s.Log.Warn("Failed to validate token %s[..]: %s", token[:10], err)
-				continue
+			for i := 0; i <= *s.Options.Threads; i++ {
+				s.Clients <- &GitHubClientWrapper{client, token, time.Now().Add(-1 * time.Second)}
 			}
 		}
 
-		s.Clients = append(s.Clients, &GitHubClientWrapper{client, token, time.Now().Add(-1 * time.Second)})
-	}
-
-	if len(s.Clients) < 1 {
-		s.Log.Fatal("No valid GitHub tokens provided. Quitting!")
+		if len(s.Clients) < 1 {
+			s.Log.Fatal("No valid GitHub tokens provided. Quitting!")
+		}
 	}
 }
 
 func (s *Session) GetClient() *GitHubClientWrapper {
-	sleepTime := 0 * time.Second
+	for {
+		select {
 
-	for _, client := range s.Clients {
-		if client.RateLimitedUntil.After(time.Now()) {
-			sleepTime = time.Until(client.RateLimitedUntil)
-			continue
+		case client := <-s.Clients:
+			s.Log.Debug("Using client with token: %s", client.Token[:10])
+			return client
+
+		case client := <-s.ExhaustedClients:
+			sleepTime := time.Until(client.RateLimitedUntil)
+			s.Log.Warn("All GitHub tokens exhausted/rate limited. Sleeping for %s", sleepTime.String())
+			time.Sleep(sleepTime)
+			s.Log.Debug("Returning client %s to pool", client.Token[:10])
+			s.FreeClient(client)
+
+		default:
+			s.Log.Debug("Available Clients: %d", len(s.Clients))
+			s.Log.Debug("Exhausted Clients: %d", len(s.ExhaustedClients))
+			time.Sleep(time.Millisecond * 1000)
 		}
-
-		return client
 	}
+}
 
-	s.Log.Warn("All GitHub tokens exchausted/rate limited. Sleeping for %s", sleepTime.String())
-	time.Sleep(sleepTime)
-
-	return s.GetClient()
+// FreeClient returns the GitHub Client to the pool of available,
+// non-rate-limited channel of clients in the session
+func (s *Session) FreeClient(client *GitHubClientWrapper) {
+	if client.RateLimitedUntil.After(time.Now()) {
+		s.ExhaustedClients <- client
+	} else {
+		s.Clients <- client
+	}
 }
 
 func (s *Session) InitThreads() {
@@ -140,8 +163,9 @@ func GetSession() *Session {
 	sessionSync.Do(func() {
 		session = &Session{
 			Context:      context.Background(),
-			Repositories: make(chan int64, 1000),
+			Repositories: make(chan GitResource, 1000),
 			Gists:        make(chan string, 100),
+			Comments:     make(chan string, 1000),
 		}
 
 		if session.Options, err = ParseOptions(); err != nil {
@@ -149,12 +173,11 @@ func GetSession() *Session {
 			os.Exit(1)
 		}
 
-		if session.Config, err = ParseConfig(); err != nil {
+		if session.Config, err = ParseConfig(session.Options); err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
 
-		session.Version = Version
 		session.Start()
 	})
 

@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/google/go-github/github"
@@ -21,35 +23,51 @@ const (
 func GetRepositories(session *Session) {
 	localCtx, cancel := context.WithCancel(session.Context)
 	defer cancel()
-	observedKeys := map[int64]bool{}
+
+	observedKeys := map[string]bool{}
+	var client *GitHubClientWrapper
+
 	for c := time.Tick(sleep); ; {
 		opt := &github.ListOptions{PerPage: perPage}
-		client := session.GetClient()
 
 		for {
+			if client != nil {
+				session.FreeClient(client)
+			}
+
+			client = session.GetClient()
 			events, resp, err := client.Activity.ListEvents(localCtx, opt)
 
 			if err != nil {
 				if _, ok := err.(*github.RateLimitError); ok {
 					session.Log.Warn("Token %s[..] rate limited. Reset at %s", client.Token[:10], resp.Rate.Reset)
 					client.RateLimitedUntil = resp.Rate.Reset.Time
+					session.FreeClient(client)
 					break
 				}
 
 				if _, ok := err.(*github.AbuseRateLimitError); ok {
-					GetSession().Log.Fatal("GitHub API abused detected. Quitting...")
+					session.Log.Fatal("GitHub API abused detected. Quitting...")
 				}
 
-				GetSession().Log.Important("Error getting GitHub events... trying again", err)
+				session.Log.Warn("Error getting GitHub events: %s... trying again", err)
 			}
 
 			if opt.Page == 0 {
-				session.Log.Warn("Token %s[..] has %d/%d calls remaining.", client.Token[:10], resp.Rate.Remaining, resp.Rate.Limit)
+				tokenMessage := fmt.Sprintf("[?] Token %s[..] has %d/%d calls remaining.", client.Token[:10], resp.Rate.Remaining, resp.Rate.Limit)
+
+				if resp.Rate.Remaining < 100 {
+					session.Log.Warn(tokenMessage)
+				} else {
+					session.Log.Debug(tokenMessage)
+				}
 			}
 
 			newEvents := make([]*github.Event, 0, len(events))
+
+			// remove duplicates
 			for _, e := range events {
-				if observedKeys[e.GetRepo().GetID()] {
+				if observedKeys[*e.ID] {
 					continue
 				}
 
@@ -58,8 +76,28 @@ func GetRepositories(session *Session) {
 
 			for _, e := range newEvents {
 				if *e.Type == "PushEvent" {
-					observedKeys[e.GetRepo().GetID()] = true
-					session.Repositories <- e.GetRepo().GetID()
+					observedKeys[*e.ID] = true
+
+					dst := &github.PushEvent{}
+					json.Unmarshal(e.GetRawPayload(), dst)
+					session.Repositories <- GitResource{
+						Id:   e.GetRepo().GetID(),
+						Type: GITHUB_SOURCE,
+						Url:  e.GetRepo().GetURL(),
+						Ref:  dst.GetRef(),
+					}
+				} else if *e.Type == "IssueCommentEvent" {
+					observedKeys[*e.ID] = true
+
+					dst := &github.IssueCommentEvent{}
+					json.Unmarshal(e.GetRawPayload(), dst)
+					session.Comments <- *dst.Comment.Body
+				} else if *e.Type == "IssuesEvent" {
+					observedKeys[*e.ID] = true
+
+					dst := &github.IssuesEvent{}
+					json.Unmarshal(e.GetRawPayload(), dst)
+					session.Comments <- dst.Issue.GetBody()
 				}
 			}
 
@@ -88,27 +126,33 @@ func GetGists(session *Session) {
 	observedKeys := map[string]bool{}
 	opt := &github.GistListOptions{}
 
+	var client *GitHubClientWrapper
 	for c := time.Tick(sleep); ; {
-		client := session.GetClient()
+		if client != nil {
+			session.FreeClient(client)
+		}
+
+		client = session.GetClient()
 		gists, resp, err := client.Gists.ListAll(localCtx, opt)
 
 		if err != nil {
 			if _, ok := err.(*github.RateLimitError); ok {
 				session.Log.Warn("Token %s[..] rate limited. Reset at %s", client.Token[:10], resp.Rate.Reset)
 				client.RateLimitedUntil = resp.Rate.Reset.Time
+				session.FreeClient(client)
 				break
 			}
 
 			if _, ok := err.(*github.AbuseRateLimitError); ok {
-				GetSession().Log.Fatal("GitHub API abused detected. Quitting...")
+				session.Log.Fatal("GitHub API abused detected. Quitting...")
 			}
 
-			GetSession().Log.Important("Error getting GitHub Gists... trying again", err)
+			session.Log.Warn("Error getting GitHub Gists: %s ... trying again", err)
 		}
 
 		newGists := make([]*github.Gist, 0, len(gists))
 		for _, e := range gists {
-			if observedKeys[e.GetID()] {
+			if observedKeys[*e.ID] {
 				continue
 			}
 
@@ -116,8 +160,8 @@ func GetGists(session *Session) {
 		}
 
 		for _, e := range newGists {
-			observedKeys[e.GetID()] = true
-			session.Gists <- e.GetGitPullURL()
+			observedKeys[*e.ID] = true
+			session.Gists <- *e.GitPullURL
 		}
 
 		opt.Since = time.Now()
@@ -134,6 +178,8 @@ func GetGists(session *Session) {
 
 func GetRepository(session *Session, id int64) (*github.Repository, error) {
 	client := session.GetClient()
+	defer session.FreeClient(client)
+
 	repo, resp, err := client.Repositories.GetByID(session.Context, id)
 
 	if err != nil {

@@ -3,6 +3,7 @@ package core
 import (
 	"regexp"
 	"regexp/syntax"
+	"strings"
 )
 
 const (
@@ -18,7 +19,7 @@ const (
 type Signature interface {
 	Name() string
 	Match(file MatchFile) (bool, string)
-	GetContentsMatches(file MatchFile) []string
+	GetContentsMatches(contents []byte) []string
 }
 
 type SimpleSignature struct {
@@ -56,7 +57,7 @@ func (s SimpleSignature) Match(file MatchFile) (bool, string) {
 	return (s.match == *haystack), matchPart
 }
 
-func (s SimpleSignature) GetContentsMatches(file MatchFile) []string {
+func (s SimpleSignature) GetContentsMatches(contents []byte) []string {
 	return nil
 }
 
@@ -89,11 +90,22 @@ func (s PatternSignature) Match(file MatchFile) (bool, string) {
 	return s.match.MatchString(*haystack), matchPart
 }
 
-func (s PatternSignature) GetContentsMatches(file MatchFile) []string {
+func (s PatternSignature) GetContentsMatches(contents []byte) []string {
 	matches := make([]string, 0)
 
-	for _, match := range s.match.FindAllSubmatch(file.Contents, -1) {
-		matches = append(matches, string(match[0]))
+	for _, match := range s.match.FindAllSubmatch(contents, -1) {
+		match := string(match[0])
+		blacklistedMatch := false
+
+		for _, blacklistedString := range session.Config.BlacklistedStrings {
+			if strings.Contains(strings.ToLower(match), strings.ToLower(blacklistedString)) {
+				blacklistedMatch = true
+			}
+		}
+
+		if !blacklistedMatch {
+			matches = append(matches, match)
+		}
 	}
 
 	return matches
